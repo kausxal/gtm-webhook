@@ -1,10 +1,13 @@
+const { waitUntil } = require("@vercel/functions");
 const { z } = require("zod");
-const { Client } = require("@upstash/qstash");
+const { isDuplicate } = require("../lib/dedup");
+const { checkHubspot, createContact } = require("../lib/hubspot");
+const { scoreICP } = require("../lib/icp");
+const { addToHeyReach } = require("../lib/heyreach");
+const { addToInstantly } = require("../lib/instantly");
+const { notify } = require("../lib/slack");
 
-// Initialize QStash
-const qstash = new Client({
-  token: process.env.QSTASH_TOKEN || "dummy-token",
-});
+const MIN_SCORE = parseInt(process.env.ICP_MIN_SCORE || "60");
 
 // 1. Zod Schema: Strict Validation for RB2B Payload
 const rb2bSchema = z.object({
@@ -26,6 +29,63 @@ const rb2bSchema = z.object({
   pages_visited: z.string().optional().catch(""),
 }).passthrough();
 
+// The background processing function
+async function processWebhook(visitor) {
+  try {
+    // Gate 1: Dedup (Using Vercel KV)
+    const duplicate = await isDuplicate(visitor.email);
+    if (duplicate) {
+      await notify("duplicate", visitor);
+      console.log(JSON.stringify({ event: "duplicate_skipped", email: visitor.email }));
+      return;
+    }
+
+    // Gate 2: HubSpot check
+    const { isBlocked, contact } = await checkHubspot(visitor.email);
+    if (isBlocked) {
+      await notify("existing_client", {
+        ...visitor,
+        lifecyclestage: contact?.lifecyclestage || "unknown"
+      });
+      console.log(JSON.stringify({ event: "hubspot_blocked", email: visitor.email }));
+      return;
+    }
+
+    // Gate 3: ICP score
+    const { score, tier, reasons } = scoreICP(visitor);
+    visitor.icpScore = score;
+    visitor.leadTier = tier;
+
+    if (score < MIN_SCORE) {
+      await notify("low_icp", {
+        ...visitor,
+        reasons: reasons.join(", ") || "no matches"
+      });
+      console.log(JSON.stringify({ event: "low_icp", email: visitor.email, score }));
+      return;
+    }
+
+    // All gates passed - fire everything in parallel
+    const [heyreachResult, instantlyResult, hubspotResult] = await Promise.all([
+      visitor.linkedinUrl ? addToHeyReach(visitor) : Promise.resolve({ success: false, error: "no linkedin" }),
+      addToInstantly(visitor),
+      createContact(visitor)
+    ]);
+
+    // Slack hot lead alert
+    await notify("hot_lead", visitor);
+    console.log(JSON.stringify({ 
+      event: "hot_lead_actioned", 
+      email: visitor.email, 
+      heyreach: heyreachResult.success, 
+      instantly: instantlyResult.success 
+    }));
+
+  } catch (error) {
+    console.error(JSON.stringify({ event: "processing_error", error: error.message }));
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -40,31 +100,32 @@ export default async function handler(req, res) {
     // A. Strict Data Validation (Zod)
     const validatedData = rb2bSchema.parse(req.body);
 
-    // B. Axiom Logging 
-    // Axiom will automatically capture this console log and turn it into searchable JSON!
+    // B. Format the visitor object
+    const visitor = {
+      email: validatedData.email,
+      firstName: validatedData.first_name || validatedData.firstName || "",
+      lastName: validatedData.last_name || validatedData.lastName || "",
+      name: `${validatedData.first_name || validatedData.firstName || ""} ${validatedData.last_name || validatedData.lastName || ""}`.trim(),
+      company: validatedData.company || "",
+      companyDomain: validatedData.company_domain || "",
+      title: validatedData.job_title || validatedData.title || "",
+      industry: validatedData.industry || "",
+      employees: validatedData.employee_count || validatedData.employees || 0,
+      linkedinUrl: validatedData.linkedin_url || validatedData.linkedinUrl || "",
+      pagesVisited: validatedData.page_url || validatedData.pages_visited || "",
+    };
+
     console.log(JSON.stringify({
       event: "webhook_received",
-      email: validatedData.email,
+      email: visitor.email,
       timestamp: new Date().toISOString()
     }));
 
-    // C. Forward to QStash Background Worker
-    // We pass our secret so the worker knows the request is legit
-    const protocol = req.headers["x-forwarded-proto"] || "http";
-    const host = req.headers.host;
-    const workerUrl = `${protocol}://${host}/api/process?secret=${process.env.RB2B_SECRET}`;
-
-    if (process.env.QSTASH_TOKEN && process.env.QSTASH_TOKEN !== "dummy-token") {
-      await qstash.publishJSON({
-        url: workerUrl,
-        body: validatedData,
-      });
-    } else {
-      console.warn("⚠️ QSTASH_TOKEN not found - please configure Upstash QStash");
-    }
+    // C. Tell Vercel to run this in the background using waitUntil
+    waitUntil(processWebhook(visitor));
 
     // D. Return 200 OK instantly to RB2B
-    return res.status(200).json({ status: "queued", email: validatedData.email });
+    return res.status(200).json({ status: "queued", email: visitor.email });
     
   } catch (error) {
     if (error instanceof z.ZodError) {
