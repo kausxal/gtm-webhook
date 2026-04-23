@@ -43,7 +43,7 @@ Once the infrastructure gates are passed, the pipeline executes parallel process
 
 ---
 
-## Interviewer / Demo Guide
+## Guide
 
 This project is built to gracefully handle missing API keys via a dry-run / fallback mechanism. To demonstrate the flow without hitting live production CRMs:
 
