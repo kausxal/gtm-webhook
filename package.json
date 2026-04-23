@@ -14,9 +14,15 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@trigger.dev/sdk": "4.4.4",
     "@vercel/functions": "^3.4.4",
     "@vercel/kv": "^3.0.0",
+    "@vercel/postgres": "^0.10.0",
     "axios": "^1.15.2",
+    "openai": "^6.34.0",
     "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@trigger.dev/build": "4.4.4"
   }
 }

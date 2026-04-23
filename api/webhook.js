@@ -1,15 +1,8 @@
-const { waitUntil } = require("@vercel/functions");
 const { z } = require("zod");
-const { isDuplicate } = require("../lib/dedup");
-const { checkHubspot, createContact } = require("../lib/hubspot");
-const { scoreICP } = require("../lib/icp");
-const { addToHeyReach } = require("../lib/heyreach");
-const { addToInstantly } = require("../lib/instantly");
-const { notify } = require("../lib/slack");
+const { saveToDataLake } = require("../lib/db");
+const { tasks } = require("@trigger.dev/sdk/v3");
 
-const MIN_SCORE = parseInt(process.env.ICP_MIN_SCORE || "60");
-
-// 1. Zod Schema: Strict Validation for RB2B Payload
+// Zod Schema
 const rb2bSchema = z.object({
   email: z.string().email("Invalid email format"),
   first_name: z.string().optional().catch(""),
@@ -29,78 +22,15 @@ const rb2bSchema = z.object({
   pages_visited: z.string().optional().catch(""),
 }).passthrough();
 
-// The background processing function
-async function processWebhook(visitor) {
-  try {
-    // Gate 1: Dedup (Using Vercel KV)
-    const duplicate = await isDuplicate(visitor.email);
-    if (duplicate) {
-      await notify("duplicate", visitor);
-      console.log(JSON.stringify({ event: "duplicate_skipped", email: visitor.email }));
-      return;
-    }
-
-    // Gate 2: HubSpot check
-    const { isBlocked, contact } = await checkHubspot(visitor.email);
-    if (isBlocked) {
-      await notify("existing_client", {
-        ...visitor,
-        lifecyclestage: contact?.lifecyclestage || "unknown"
-      });
-      console.log(JSON.stringify({ event: "hubspot_blocked", email: visitor.email }));
-      return;
-    }
-
-    // Gate 3: ICP score
-    const { score, tier, reasons } = scoreICP(visitor);
-    visitor.icpScore = score;
-    visitor.leadTier = tier;
-
-    if (score < MIN_SCORE) {
-      await notify("low_icp", {
-        ...visitor,
-        reasons: reasons.join(", ") || "no matches"
-      });
-      console.log(JSON.stringify({ event: "low_icp", email: visitor.email, score }));
-      return;
-    }
-
-    // All gates passed - fire everything in parallel
-    const [heyreachResult, instantlyResult, hubspotResult] = await Promise.all([
-      visitor.linkedinUrl ? addToHeyReach(visitor) : Promise.resolve({ success: false, error: "no linkedin" }),
-      addToInstantly(visitor),
-      createContact(visitor)
-    ]);
-
-    // Slack hot lead alert
-    await notify("hot_lead", visitor);
-    console.log(JSON.stringify({ 
-      event: "hot_lead_actioned", 
-      email: visitor.email, 
-      heyreach: heyreachResult.success, 
-      instantly: instantlyResult.success 
-    }));
-
-  } catch (error) {
-    console.error(JSON.stringify({ event: "processing_error", error: error.message }));
-  }
-}
-
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const secret = req.headers["x-webhook-secret"];
-  if (secret !== process.env.RB2B_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (secret !== process.env.RB2B_SECRET) return res.status(401).json({ error: "Unauthorized" });
 
   try {
-    // A. Strict Data Validation (Zod)
     const validatedData = rb2bSchema.parse(req.body);
 
-    // B. Format the visitor object
     const visitor = {
       email: validatedData.email,
       firstName: validatedData.first_name || validatedData.firstName || "",
@@ -115,25 +45,17 @@ export default async function handler(req, res) {
       pagesVisited: validatedData.page_url || validatedData.pages_visited || "",
     };
 
-    console.log(JSON.stringify({
-      event: "webhook_received",
-      email: visitor.email,
-      timestamp: new Date().toISOString()
-    }));
+    // 1. DATA LAKE: Save raw payload to Postgres immediately
+    await saveToDataLake(visitor);
 
-    // C. Tell Vercel to run this in the background using waitUntil
-    waitUntil(processWebhook(visitor));
+    // 2. WORKFLOW ENGINE: Trigger the robust background task
+    const handle = await tasks.trigger("process-lead", visitor);
 
-    // D. Return 200 OK instantly to RB2B
-    return res.status(200).json({ status: "queued", email: visitor.email });
+    // 3. Return 200 OK instantly to RB2B
+    return res.status(200).json({ status: "queued", trigger_id: handle.id });
     
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      console.error(JSON.stringify({ event: "validation_error", errors: error.errors }));
-      return res.status(400).json({ error: "Invalid data format", details: error.errors });
-    }
-    
-    console.error(JSON.stringify({ event: "internal_error", error: error.message }));
+    console.error("Webhook Error:", error);
     return res.status(500).json({ error: "Internal Server Error" });
   }
 }

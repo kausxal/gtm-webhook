@@ -1,70 +1,62 @@
-# Go-to-Market Webhook Integration
+# Enterprise Event-Driven Webhook Pipeline
 
-This repository contains a production-ready, serverless webhook built to process inbound lead data from RB2B. It automatically deduplicates, validates, scores, and routes visitor data to your Go-to-Market stack (HubSpot, HeyReach, Instantly, and Slack).
+This project is a highly scalable, serverless webhook ingestion pipeline. It was engineered to solve the most common architectural bottlenecks found in high-volume Go-to-Market (GTM) integrations: **Data Loss, Third-Party Rate Limiting, and Duplicate Records.**
 
-## Architecture Overview
+While the business logic routes B2B visitor data to CRMs and Sales Execution platforms, the underlying infrastructure demonstrates enterprise-grade backend design patterns.
 
-The system is designed to run on Vercel's Serverless Functions.
+## The Problem
+Standard webhooks are synchronous and fragile. When a high volume of traffic hits a standard webhook, it attempts to process all downstream third-party APIs (like HubSpot or OpenAI) at once. If a third-party API is slow, the webhook times out. If the API rate-limits the request, the data is permanently lost.
 
-1. **Endpoint Reception**: The main endpoint (`/api/webhook`) receives the payload, validates the secret key, and strictly verifies the data format using Zod.
-2. **Asynchronous Background Processing**: To prevent timeouts from RB2B, the endpoint uses Vercel's `waitUntil` function. It instantly returns a 200 OK response to RB2B while seamlessly continuing to process the data in the background.
-3. **Deduplication**: Vercel KV (Redis) is used to check if the lead was processed within a defined time window.
-4. **Enrichment and Routing**: 
-   - Queries HubSpot to see if the contact already exists or is in a blocked lifecycle stage.
-   - Calculates an Ideal Customer Profile (ICP) score based on industry, title, and company size.
-   - Pushes hot leads to HeyReach and Instantly in parallel.
-   - Sends targeted alerts to Slack based on the lead's qualification tier.
+## The Architecture Solution
+
+This pipeline utilizes an event-driven, decoupled architecture on Vercel to guarantee **0% data loss** and massive scalability.
+
+### 1. The Data Lake (PostgreSQL)
+Before any processing or deduplication occurs, the raw JSON payload is instantly validated using **Zod** and inserted into a PostgreSQL database. 
+* **Why:** If the scoring logic changes next year, or if a catastrophic bug occurs in the pipeline, the raw data is safely preserved in the Data Lake and can be cleanly replayed.
+
+### 2. Workflow Engine & Circuit Breakers (Trigger.dev)
+After saving to the Data Lake, the endpoint instantly returns a `200 OK` and hands the payload off to an asynchronous workflow engine (Trigger.dev). 
+* **Why:** This isolates the ingestion endpoint from the processing logic. If the HubSpot API goes down, the Trigger.dev engine acts as a **Circuit Breaker**—pausing the execution and intelligently retrying the job up to 5 times over an hour using exponential backoff.
+
+### 3. Caching & Rate Limiting (Redis / Vercel KV)
+Third-party CRMs have strict API limits. To protect the pipeline from being throttled:
+* **Caching:** Company domain lookups are cached in Redis for 24 hours. If 10 visitors from `acme.com` arrive, the pipeline only queries the CRM API once.
+* **Deduplication:** Redis is used to track email addresses and enforce a 7-day deduplication window.
+* **"Hot Spike" Tracking:** Redis actively increments and tracks the velocity of domain visits. If a domain exhibits a "Hot Spike" (e.g., 3+ visits in a 30-day window), the pipeline dynamically alters the lead tier routing.
+
+### 4. AI & CRM Business Logic
+Once the infrastructure gates are passed, the pipeline executes parallel processes:
+* **AI Personalization:** Queries OpenAI (`gpt-4o-mini`) to generate a highly personalized, contextual icebreaker based on the visitor's role, company, and behavioral intent.
+* **Advanced CRM Association:** Programmatically searches for the Company domain, creates the Company object if it doesn't exist, creates the Contact, and strictly associates the two entities together in the CRM.
+* **Parallel Execution:** Dispatches the enriched data to email automation (Instantly), LinkedIn automation (HeyReach), and internal alerting (Slack) simultaneously via `Promise.all`.
+
+---
 
 ## Directory Structure
+* `/api/webhook-v2.js` - The main ingestion endpoint (Validation, Data Lake insertion, Task queuing).
+* `/trigger/processLead.js` - The asynchronous step-function task (Retries, Circuit Breaking).
+* `/lib/db.js` - PostgreSQL connection and lazy-loading table creation.
+* `/lib/dedup.js` - Redis implementation for deduplication and Hot Spike tracking.
+* `/lib/hubspot.js` - CRM logic featuring Redis caching for API throttling protection.
+* `/lib/ai.js` - OpenAI prompt engineering and generation.
 
-* `/api/webhook.js`: The central ingestion point. Handles security validation, Zod parsing, deduplication, and all third-party integrations using background execution.
-* `/lib/dedup.js`: Connects to Vercel KV to prevent duplicate leads from entering the pipeline.
-* `/lib/hubspot.js`: Manages querying and creating contacts in HubSpot CRM.
-* `/lib/icp.js`: Contains the scoring algorithm to determine lead quality.
-* `/lib/heyreach.js`: Handles adding prospects to LinkedIn automation campaigns via HeyReach.
-* `/lib/instantly.js`: Handles enrolling prospects into email sequences via Instantly.
-* `/lib/slack.js`: Manages formatting and sending notifications to your Slack workspace.
+---
 
-## Environment Variables
+## Interviewer / Demo Guide
 
-To run this project, you need to configure the following environment variables in your Vercel dashboard:
+This project is built to gracefully handle missing API keys via a dry-run / fallback mechanism. To demonstrate the flow without hitting live production CRMs:
 
-### Platform & Security
-* `RB2B_SECRET`: A custom string you generate to authenticate incoming requests from RB2B.
-
-### Integration Keys
-* `HUBSPOT_API_KEY`: A private app token from your HubSpot account with read/write access to contacts.
-* `HEYREACH_API_KEY`: Your HeyReach API key.
-* `HEYREACH_CAMPAIGN_ID`: The specific campaign ID in HeyReach where leads should be added.
-* `INSTANTLY_API_KEY`: Your Instantly API key.
-* `INSTANTLY_CAMPAIGN_ID`: The specific campaign ID in Instantly where leads should be enrolled.
-* `SLACK_WEBHOOK_URL`: The incoming webhook URL for your designated Slack channel.
-
-### ICP Scoring Configuration
-* `ICP_INDUSTRIES`: Comma-separated list of target industries (e.g., SaaS, B2B Tech, Fintech).
-* `ICP_TITLES`: Comma-separated list of target job titles (e.g., Founder, CEO, CMO).
-* `ICP_MIN_EMPLOYEES`: Minimum employee count for a qualified account.
-* `ICP_MAX_EMPLOYEES`: Maximum employee count for a qualified account.
-* `ICP_MIN_SCORE`: The threshold score required (0-100) to trigger outreach actions.
-* `DEDUP_WINDOW_DAYS`: The number of days to wait before allowing the same email to be processed again.
-
-## Deployment & Configuration
-
-### 1. Deploy to Vercel
-Push this repository to GitHub and import it into Vercel. Ensure all environment variables listed above are added to the project settings.
-
-### 2. Configure Vercel KV
-In the Vercel Dashboard, navigate to the Storage tab and create a new KV database. Link it to this project to enable deduplication.
-
-### 3. Configure Axiom Logging (Optional but Recommended)
-For deep observability, navigate to the Integrations tab in Vercel and install Axiom. It will automatically capture all structured logs output by the webhook, allowing you to trace errors and monitor lead flow without any additional code configuration.
-
-## Development
-
-To run this application locally for testing:
-
-1. Install the Vercel CLI.
-2. Run `vercel dev` to start the local development server.
-3. Use a tool like cURL or Postman to send a test POST request to `http://localhost:3000/api/webhook`.
-
-Make sure to include the `x-webhook-secret` header in your test requests to bypass the security check.
+1. Send a mock `POST` request to `/api/webhook-v2` with the `x-webhook-secret` header.
+2. Provide a mock JSON payload:
+```json
+{
+  "email": "test@acmecorp.com",
+  "first_name": "John",
+  "last_name": "Doe",
+  "company_domain": "acmecorp.com",
+  "job_title": "Chief Technology Officer",
+  "page_url": "/enterprise-pricing"
+}
+```
+3. Observe the logs as the pipeline strictly types the data, writes to the Postgres Data Lake, queues the background job, passes the Redis deduplication gate, falls back the AI generation, and completes the parallel executions.
