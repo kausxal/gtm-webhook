@@ -1,11 +1,30 @@
-const { isDuplicate } = require("../lib/dedup");
-const { checkHubspot, createContact } = require("../lib/hubspot");
-const { scoreICP } = require("../lib/icp");
-const { addToHeyReach } = require("../lib/heyreach");
-const { addToInstantly } = require("../lib/instantly");
-const { notify } = require("../lib/slack");
+const { z } = require("zod");
+const { Client } = require("@upstash/qstash");
 
-const MIN_SCORE = parseInt(process.env.ICP_MIN_SCORE || "60");
+// Initialize QStash
+const qstash = new Client({
+  token: process.env.QSTASH_TOKEN || "dummy-token",
+});
+
+// 1. Zod Schema: Strict Validation for RB2B Payload
+const rb2bSchema = z.object({
+  email: z.string().email("Invalid email format"),
+  first_name: z.string().optional().catch(""),
+  firstName: z.string().optional().catch(""),
+  last_name: z.string().optional().catch(""),
+  lastName: z.string().optional().catch(""),
+  company: z.string().optional().catch(""),
+  company_domain: z.string().optional().catch(""),
+  job_title: z.string().optional().catch(""),
+  title: z.string().optional().catch(""),
+  industry: z.string().optional().catch(""),
+  employee_count: z.union([z.number(), z.string()]).optional().catch(0),
+  employees: z.union([z.number(), z.string()]).optional().catch(0),
+  linkedin_url: z.string().url().optional().or(z.literal("")).catch(""),
+  linkedinUrl: z.string().url().optional().or(z.literal("")).catch(""),
+  page_url: z.string().optional().catch(""),
+  pages_visited: z.string().optional().catch(""),
+}).passthrough();
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -17,72 +36,43 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const body = req.body;
+  try {
+    // A. Strict Data Validation (Zod)
+    const validatedData = rb2bSchema.parse(req.body);
 
-  const visitor = {
-    email: body.email || "",
-    firstName: body.first_name || body.firstName || "",
-    lastName: body.last_name || body.lastName || "",
-    name: `${body.first_name || ""} ${body.last_name || ""}`.trim(),
-    company: body.company || "",
-    companyDomain: body.company_domain || "",
-    title: body.job_title || body.title || "",
-    industry: body.industry || "",
-    employees: body.employee_count || body.employees || 0,
-    linkedinUrl: body.linkedin_url || body.linkedinUrl || "",
-    pagesVisited: body.page_url || body.pages_visited || "",
-  };
+    // B. Axiom Logging 
+    // Axiom will automatically capture this console log and turn it into searchable JSON!
+    console.log(JSON.stringify({
+      event: "webhook_received",
+      email: validatedData.email,
+      timestamp: new Date().toISOString()
+    }));
 
-  if (!visitor.email) {
-    return res.status(400).json({ error: "No email in payload" });
+    // C. Forward to QStash Background Worker
+    // We pass our secret so the worker knows the request is legit
+    const protocol = req.headers["x-forwarded-proto"] || "http";
+    const host = req.headers.host;
+    const workerUrl = `${protocol}://${host}/api/process?secret=${process.env.RB2B_SECRET}`;
+
+    if (process.env.QSTASH_TOKEN && process.env.QSTASH_TOKEN !== "dummy-token") {
+      await qstash.publishJSON({
+        url: workerUrl,
+        body: validatedData,
+      });
+    } else {
+      console.warn("⚠️ QSTASH_TOKEN not found - please configure Upstash QStash");
+    }
+
+    // D. Return 200 OK instantly to RB2B
+    return res.status(200).json({ status: "queued", email: validatedData.email });
+    
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      console.error(JSON.stringify({ event: "validation_error", errors: error.errors }));
+      return res.status(400).json({ error: "Invalid data format", details: error.errors });
+    }
+    
+    console.error(JSON.stringify({ event: "internal_error", error: error.message }));
+    return res.status(500).json({ error: "Internal Server Error" });
   }
-
-  // Gate 1: Dedup
-  const duplicate = isDuplicate(visitor.email);
-  if (duplicate) {
-    await notify("duplicate", visitor);
-    return res.status(200).json({ status: "skipped", reason: "duplicate" });
-  }
-
-  // Gate 2: HubSpot check
-  const { isBlocked, contact } = await checkHubspot(visitor.email);
-  if (isBlocked) {
-    await notify("existing_client", {
-      ...visitor,
-      lifecyclestage: contact?.lifecyclestage || "unknown"
-    });
-    return res.status(200).json({ status: "skipped", reason: "existing_contact" });
-  }
-
-  // Gate 3: ICP score
-  const { score, tier, reasons } = scoreICP(visitor);
-  visitor.icpScore = score;
-  visitor.leadTier = tier;
-
-  if (score < MIN_SCORE) {
-    await notify("low_icp", {
-      ...visitor,
-      reasons: reasons.join(", ") || "no matches"
-    });
-    return res.status(200).json({ status: "skipped", reason: "low_icp", score });
-  }
-
-  // All gates passed - fire everything in parallel
-  const [heyreachResult, instantlyResult, hubspotResult] = await Promise.all([
-    visitor.linkedinUrl ? addToHeyReach(visitor) : Promise.resolve({ success: false, error: "no linkedin" }),
-    addToInstantly(visitor),
-    createContact(visitor)
-  ]);
-
-  // Slack hot lead alert
-  await notify("hot_lead", visitor);
-
-  return res.status(200).json({
-    status: "actioned",
-    score,
-    tier,
-    heyreach: heyreachResult.success,
-    instantly: instantlyResult.success,
-    hubspot: hubspotResult
-  });
 }
