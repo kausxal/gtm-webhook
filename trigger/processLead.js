@@ -1,4 +1,4 @@
-const { task } = require("@trigger.dev/sdk/v3");
+const { task } = require("@trigger.dev/sdk");
 const { checkVisitorStatus } = require("../lib/dedup");
 const { checkHubspot, createContact } = require("../lib/hubspot");
 const { scoreICP } = require("../lib/icp");
@@ -6,57 +6,54 @@ const { addToHeyReach } = require("../lib/heyreach");
 const { addToInstantly } = require("../lib/instantly");
 const { notify } = require("../lib/slack");
 const { generateIcebreaker } = require("../lib/ai");
+const { applyHotSpike } = require("../lib/visitor");
+const { saveFailedLead } = require("../lib/db");
 
 const MIN_SCORE = parseInt(process.env.ICP_MIN_SCORE || "60");
 
 export const processLeadTask = task({
   id: "process-lead",
   retry: {
-    maxAttempts: 5,         // The Circuit Breaker: Retries up to 5 times if an API fails
-    minTimeoutInMs: 30000,  // Wait 30 seconds before first retry
-    maxTimeoutInMs: 3600000, // Max wait time 1 hour between retries
-    factor: 2,              // Exponential backoff (30s -> 60s -> 120s)
+    maxAttempts: 5,
+    minTimeoutInMs: 30000,
+    maxTimeoutInMs: 3600000,
+    factor: 2,
   },
   run: async (visitor, { ctx }) => {
     console.log(`Starting Workflow for ${visitor.email}`);
 
-    // Gate 1: Dedup
-    const { isDuplicate, domainVisits } = await checkVisitorStatus(visitor.email, visitor.companyDomain);
-    if (isDuplicate) return { status: "duplicate", email: visitor.email };
+    try {
+      const { isDuplicate, domainVisits } = await checkVisitorStatus(visitor.email, visitor.companyDomain);
+      if (isDuplicate) return { status: "duplicate", email: visitor.email };
 
-    // Gate 2: Hubspot
-    const { isBlocked, contact } = await checkHubspot(visitor.email);
-    if (isBlocked) return { status: "hubspot_blocked", email: visitor.email };
+      const { isBlocked, contact } = await checkHubspot(visitor.email);
+      if (isBlocked) return { status: "hubspot_blocked", email: visitor.email };
 
-    // Gate 3: Score
-    const { score, tier, reasons } = scoreICP(visitor);
-    visitor.isHotSpike = domainVisits >= 3;
-    if (visitor.isHotSpike) {
-       visitor.icpScore = score + 25;
-       visitor.leadTier = "hot";
-    } else {
-       visitor.icpScore = score;
-       visitor.leadTier = tier;
+      const { score, tier, reasons } = scoreICP(visitor);
+      const enrichedVisitor = applyHotSpike(visitor, domainVisits, score);
+
+      if (enrichedVisitor.icpScore < MIN_SCORE) return { status: "low_icp", score: enrichedVisitor.icpScore };
+
+      const icebreaker = await generateIcebreaker(enrichedVisitor);
+      enrichedVisitor.icebreaker = icebreaker;
+
+      const [heyreachResult, instantlyResult, hubspotResult] = await Promise.all([
+        enrichedVisitor.linkedinUrl ? addToHeyReach(enrichedVisitor) : Promise.resolve({ success: false }),
+        addToInstantly(enrichedVisitor),
+        createContact(enrichedVisitor)
+      ]);
+
+      await notify("hot_lead", enrichedVisitor);
+
+      return {
+        success: true,
+        actions: { heyreach: heyreachResult, instantly: instantlyResult, hubspot: hubspotResult }
+      };
+
+    } catch (error) {
+      console.error(`[ERROR] Process lead failed: ${error.message}`);
+      await saveFailedLead(visitor, error.message);
+      throw error;
     }
-
-    if (visitor.icpScore < MIN_SCORE) return { status: "low_icp", score };
-
-    // Generate AI Icebreaker
-    visitor.icebreaker = await generateIcebreaker(visitor);
-
-    // Execute API calls. If ANY of these fail (e.g. rate limit),
-    // Trigger.dev catches the error and automatically schedules a retry!
-    const [heyreachResult, instantlyResult, hubspotResult] = await Promise.all([
-      visitor.linkedinUrl ? addToHeyReach(visitor) : Promise.resolve({ success: false }),
-      addToInstantly(visitor),
-      createContact(visitor)
-    ]);
-
-    await notify("hot_lead", visitor);
-
-    return { 
-      success: true, 
-      actions: { heyreach: heyreachResult, instantly: instantlyResult, hubspot: hubspotResult }
-    };
   }
 });
